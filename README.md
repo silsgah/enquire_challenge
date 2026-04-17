@@ -7,61 +7,55 @@
 
 ## Quick Start
 
-### Prerequisites
-- Docker & Docker Compose
-- Python 3.11+
-- An Anthropic API key
-
-### 1. Clone and configure
+### The Easy Way: Using the `Makefile` (Recommended)
+This project includes a `Makefile` to streamline execution. After adding your API key to `.env`, run:
 ```bash
-git clone <repo>
-cd crm-sidecar
-cp .env.example .env
-# Edit .env and add your ANTHROPIC_API_KEY
+make up          # 1. Start both Postgres databases via Docker
+make seed        # 2. Reset and populate source DB with realistic records
+make pipeline    # 3. Fast-forward through Sync -> Score -> AI Summarize
+make api         # 4. Start the FastAPI Interface (available at localhost:8000/docs)
+make test        # 5. Run the pure-Python unit test suite
+make down        # 6. Stop all Docker containers
 ```
 
-### 2. Start the databases
+---
+
+### The Manual Way (Step-by-Step)
+
+If you prefer to run scripts individually without `make`:
+
+**1. Start the databases**
 ```bash
 docker compose up -d
 # Wait for both DBs to be healthy:
 docker compose ps
 ```
 
-### 3. Install Python deps
+**2. Install Python deps**
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 4. Seed the source DB
+**3. Seed the source DB (Task 0)**
 ```bash
 python seed/generate_seed.py
-# ✓ Seeded 55 companies, 350+ users, 10,000+ events, 200+ tickets
 ```
 
-### 5. Run the full pipeline
+**4. Run Pipeline Steps individually (Tasks 1-4)**
 ```bash
-# Sync source → sidecar
-python sync/sync_engine.py
-
-# Score all accounts
-python scoring/scorer.py
-
-# Generate AI summaries (uses Anthropic API)
-python ai/summarizer.py
-
-# Scan for at-risk alerts
-python alerts/monitor.py
+python sync/sync_engine.py       # Incremental Sync
+python scoring/scorer.py         # Compute Health Scores
+python ai/summarizer.py          # Generate AI Summaries
+python alerts/monitor.py         # Detect At-Risk targets
 ```
 
-### 6. Start the API
+**5. Start the API**
 ```bash
-cd interface
-uvicorn main:app --reload --port 8000
-# OpenAPI docs: http://localhost:8000/docs
+uvicorn interface.main:app --reload --port 8000
 ```
 
-### 7. Run tests
+**6. Run Tests**
 ```bash
 pytest tests/ -v
 ```
