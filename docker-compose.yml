@@ -1,0 +1,44 @@
+version: "3.9"
+
+services:
+  source_db:
+    image: postgres:16-alpine
+    container_name: crm_source_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: crm_source
+      POSTGRES_USER: source_user
+      POSTGRES_PASSWORD: source_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - source_db_data:/var/lib/postgresql/data
+      - ./init/source_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U source_user -d crm_source"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  sidecar_db:
+    image: postgres:16-alpine
+    container_name: crm_sidecar_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: crm_sidecar
+      POSTGRES_USER: sidecar_user
+      POSTGRES_PASSWORD: sidecar_pass
+    ports:
+      - "5433:5432"
+    volumes:
+      - sidecar_db_data:/var/lib/postgresql/data
+      - ./init/sidecar_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sidecar_user -d crm_sidecar"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  source_db_data:
+  sidecar_db_data:
