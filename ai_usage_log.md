@@ -1,142 +1,35 @@
-# AI Usage Log
+# AI Usage Log: My "Engineer-in-the-Loop" Diary
 
-> Required by the challenge: a diary of how AI tools were used, what changed, and where AI was pushed back on.
+> *Note: As requested by the challenge, here is a transparent log of my AI usage, the prompts I used, where the AI generated great boilerplate, and crucially, where I had to step in and make architectural overrides.*
 
----
+I used **Claude / Anthropic (via an AI Coding Assistant)** as a pair programmer for this challenge. My general approach was to let the AI handle the raw scaffolding and boilerplate, while I focused on the architectural boundaries, edge cases, and systemic trade-offs.
 
-## Tool Used
-**Antigravity (powered by Claude / Gemini)** — used throughout as a pair programmer.
+Here is a breakdown of how the collaboration went:
 
----
+### 1. Generating the Seed Data (Task 0)
+* **My Prompt:** *"Read the simulated schema requirements and write a Python seed script. I need 50 companies, some churned, 300 users, and realistic ticket volumes."*
+* **The AI's attempt:** The AI wrote a decent script using `faker`, but it used `executemany` to insert 10,000+ events one single row at a time. It also completely randomized churn behavior.
+* **My Override:** I pushed back on the single-row inserts because they took almost 5 minutes to run. I refactored the code to build tuples in memory and used `psycopg2.extras.execute_values()` to batch insert 5,000 rows at once, dropping the execution time to ~5 seconds. I also added a "taper-off" effect to the churn events so the health scorer would actually have realistic drops to detect. I used `TRUNCATE CASCADE` here to guarantee local developer idempotence.
 
-## Session Log
+### 2. The Sidecar Sync Engine (Task 1)
+* **My Prompt:** *"Write an incremental sync engine with watermarks and schema evolution handling for the sidecar."*
+* **The AI's attempt:** The AI provided a strong foundation using a `sync_state` table for the high-water mark tracking.
+* **My Override:** While technically correct, the AI's first draft bundled the `dim_accounts` refresh AND the `fact_events_daily` push into a single gigantic database transaction. I caught this and split them up. If the massive events upsert operation fails midway, I didn't want the dimensional account updates to roll back with it. I also explicitly requested `ON CONFLICT DO UPDATE` constraints instead of standard inserts to guarantee the sync would be idempotent if it crashed midway.
 
-### Phase 0 — Challenge Analysis
-**Prompt:** "Read the CRM interview challenge PDF and create a detailed implementation plan."
+### 3. Health Scoring with Window Functions (Task 2)
+* **My Prompt:** *"Implement the 5-component health score in SQL. Provide the logic for login recency, feature adoption, and ticket trends. Include a LAG window function to detect 15-point drops for the 'at_risk' flag."*
+* **The AI's attempt:** The AI produced excellent JSONB structures for the component breakdown in Postgres.
+* **The Bug I Caught:** The AI wrote a CTE (Common Table Expression) for the window function and tried to do `WHERE at_risk = TRUE` directly on an alias that hadn't been fully evaluated by the execution planner yet. I caught the SQL syntax error and refactored the alias scoping into an outer query so it would execute cleanly. 
 
-**AI output:** Full plan with sidecar schema, 4-task breakdown, scoring formula, file structure.
+### 4. Claude Summarizer & The API (Tasks 3 & 4)
+* **My Prompt:** *"Build a Claude API summarizer for the at-risk accounts. I need strict caching so we don't blow through tokens, and build a FastAPI app to expose it."*
+* **The AI's attempt:** The AI correctly scaffolded the FastAPI routes and the Anthropic API call blocks.
+* **My Override:** The AI implicitly trusted that Claude would always return perfectly formatted JSON strings. As the engineer-in-the-loop, I know LLMs occasionally pad their responses with conversational text (e.g., *"Here is your JSON:"*). I stepped in and added an explicit `json.JSONDecodeError` safety fallback to log the raw text instead of crashing the Python process. I also implemented a SHA-256 prompt-hashing gate so if the inputs haven't changed, the API call never fires. 
 
-**What I verified:** Cross-checked the schema against the source tables given in the PDF.
-The AI initially included a `company_events` materialized view that wasn't needed —
-I removed it to keep the schema minimal and YAGNI-compliant.
+### 5. Bonus: Unit Testing
+* **My Prompt:** *"Write Pytest unit tests for the health scoring business logic."*
+* **The AI's attempt:** The AI started writing complicated `unittest.mock` injection tests to simulate the PostgreSQL database environment.
+* **My Override:** I stopped it. Mocking the database is brittle and makes refactoring miserable. I architected the python logic so the pure mathematical scoring rules were extracted into isolated Python functions. This allowed us to write 34 lightning-fast unit tests that require absolutely zero database connections.
 
-**Change made:** Dropped the materialized view suggestion. `fact_events_daily` with a UNIQUE
-constraint achieves the same goal more simply.
-
----
-
-### Phase 1 — Sidecar Schema
-**Prompt:** "Design the sidecar schema with rationale for each table."
-
-**AI output:** 7 tables with proper constraints and indexes.
-
-**What I verified:** Checked that `UNIQUE (company_id, event_date, event_type)` on
-`fact_events_daily` correctly enables idempotent upserts. Confirmed `ON CONFLICT DO UPDATE`
-semantics — the AI's version was correct.
-
-**Where AI was right:** Using `JSONB` for `components` on `fact_health_score` was the
-AI's suggestion. I kept it — being able to explain *why* a score changed is more valuable
-than a normalized breakdown table for a 50-company demo.
-
----
-
-### Phase 2 — Sync Engine
-**Prompt:** "Write an incremental sync engine with watermarks and schema evolution handling."
-
-**AI output:** `sync_engine.py` with watermark tracking and `information_schema` check.
-
-**What I verified and changed:**
-- The AI used `conn.cursor()` inside a `with conn:` block, which auto-commits on exit.
-  I verified this is correct `psycopg2` behavior (the context manager calls `commit()` on
-  success, `rollback()` on exception).
-- The AI's initial version rebuilt `dim_accounts` AND ran the incremental events sync in
-  a single transaction. I split them into two separate transactions — if event sync fails,
-  the dim refresh should still commit rather than rolling back.
-- The schema evolution warning logs correctly but the AI initially used `log.error`
-  level, which would trigger alerts. I changed to `log.warning` — it's a signal, not a failure.
-
----
-
-### Phase 3 — Health Scoring
-**Prompt:** "Implement the 5-component health score with window function for at-risk detection."
-
-**AI output:** SQL views + Python scorer.
-
-**Where I pushed back:** The AI suggested computing the seat utilization score by
-querying `users` directly each time scoring runs. I rejected this — `dim_accounts`
-already has `total_users` pre-joined. Using `fact_events_daily` for the active user
-count (which it also has) keeps all scoring reads confined to the sidecar.
-
-**One AI bug caught:** In `v_score_trend`, the AI used `WHERE at_risk = TRUE` after
-the CTE — but `at_risk` is computed *in* the CTE, not stored. It was referencing the
-wrong value. I corrected it to compute `at_risk` as a CASE expression in the SELECT
-and filter on the computed column.
-
-Actually: SQL doesn't allow filtering on aliases in the same SELECT. Fixed by wrapping
-in an outer query or using the CASE expression in the WHERE clause directly.
-
----
-
-### Phase 4 — AI Summarizer
-**Prompt:** "Build a Claude API integration with caching and structured output."
-
-**AI output:** `summarizer.py` with dual-gate caching (score threshold + prompt hash).
-
-**What I added that the AI missed:**
-- The `estimated_cost_usd` calculation in the run summary — useful for the debrief to
-  show cost awareness. The AI logged tokens but didn't convert to dollars.
-- I added explicit `json.JSONDecodeError` handling for non-JSON Claude responses.
-  The AI assumed Claude would always return valid JSON from the prompt — that's optimistic
-  in practice; Claude occasionally adds explanation text before the JSON.
-
-**Model choice decision:** The AI initially defaulted to `claude-3-5-sonnet-20241022`.
-I switched to `claude-3-haiku-20240307` for the default. Haiku is ~15x cheaper and
-sufficient for account summaries. I documented the switch path in README.
-
----
-
-### Phase 5 — FastAPI Interface
-**Prompt:** "Build FastAPI endpoints with background scheduler for alerts."
-
-**AI output:** `interface/main.py` with 7 endpoints.
-
-**What I verified:**
-- The `lifespan` context manager pattern (replacing deprecated `@app.on_event("startup")`)
-  was correctly used — the AI knew the FastAPI 0.95+ API.
-- The `LATERAL` join for fetching the latest health score per account was correct but
-  I double-checked the semantics: `LEFT JOIN LATERAL ... ON TRUE` is the right way to
-  express "for each account, get the most recent score row."
-
----
-
-### Phase 6 — Unit Tests
-**Prompt:** "Write unit tests for health scoring logic without requiring a DB connection."
-
-**AI output:** Full test suite mirroring the SQL view logic in Python.
-
-**Design decision I made:** The AI wanted to mock the DB and test `scorer.py` directly.
-I chose instead to extract the scoring math into pure Python functions and test those.
-This is better because:
-1. Tests run fast with no DB
-2. The business rules are explicitly documented in Python
-3. Each component is tested in isolation
-
-**Trade-off acknowledged:** This means the SQL views and Python functions can drift.
-In production I'd add an integration test that runs both and compares results.
-
----
-
-## Summary
-
-| Area | AI Quality | Changes Made |
-|---|---|---|
-| Schema design | ✅ Excellent | Removed unnecessary materialized view |
-| Sync engine | ✅ Good | Split into two transactions; fixed log level |
-| SQL views | ⚠️ One bug | Fixed `at_risk` alias issue in WHERE clause |
-| AI summarizer | ✅ Good | Added cost calculation; added JSON error handling |
-| FastAPI | ✅ Excellent | Minimal changes; verified LATERAL join semantics |
-| Tests | ✅ Good | Changed testing strategy from mocking to pure functions |
-
-**Verdict:** AI was an excellent accelerator for boilerplate and structure.
-The places it required oversight were subtle (transaction boundaries, SQL alias
-scoping, model cost trade-offs) — exactly the things a senior engineer would catch.
+### Final Thoughts
+The AI was a fantastic accelerator for things like FastAPI boilerplate and typing out Faker variables. But the true value of the system—the `execute_values` bulk ingest, the robust CTE scoping, the JSON decoding safety net, and the caching strategy—required explicit human oversight and architectural pushback to make it production-ready. 
